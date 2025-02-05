@@ -41,6 +41,9 @@ import os
 import torch
 import torch.distributed as dist
 from lhotse import CutSet
+from pyannote.audio import Audio, Model, Pipeline
+from pyannote.audio.pipelines import VoiceActivityDetection
+from pyannote.core import Segment
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 
@@ -48,10 +51,12 @@ import s3tokenizer
 
 
 class AudioDataset(Dataset):
-    def __init__(self, cuts_path):
+    def __init__(self, cuts_path, vad_pipeline, audio_processer):
         self.data = (
             CutSet.from_file(cuts_path).filter(lambda c: c.duration <= 30).to_eager()
         )
+        self.vad_pipeline = vad_pipeline
+        self.audio_processer = audio_processer
 
     def __len__(self):
         return len(self.data)
@@ -59,8 +64,23 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx):
         cut = self.data[idx]
         key = cut.id
-        audio = cut.resample(16000).load_audio().squeeze()
-        mel = s3tokenizer.log_mel_spectrogram(audio)
+        waveform = cut.resample(16000).load_audio()  # numpy.ndarray (1, T)
+
+        try:
+            audio = {'waveform': torch.from_numpy(waveform), 'sample_rate': 16000}
+            segments = []
+            for segment in self.vad_pipeline(audio).get_timeline():
+                segment = Segment(
+                    max(segment.start - 0.05, 0.0),
+                    min(segment.end + 0.15, waveform.shape[1] / 16000),
+                )
+                segments.append(self.audio_processer.crop(audio, segment)[0])
+
+            audio_vad = torch.cat(segments, dim=1).numpy() if len(segments) > 0 else waveform
+        except:
+            audio_vad = waveform
+
+        mel = s3tokenizer.log_mel_spectrogram(audio_vad.squeeze(0))
         return key, mel
 
 
@@ -80,6 +100,25 @@ def init_distributed():
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
     return world_size, local_rank, rank
+
+
+def get_vad_pipeline():
+    config = {
+        # remove speech regions shorter than that many seconds.
+        "min_duration_on": 0.2,
+        # fill non-speech regions shorter than that many seconds.
+        "min_duration_off": 0.2,
+    }
+
+    model = Model.from_pretrained(
+        "pyannote/segmentation-3.0", 
+        use_auth_token="",
+    )
+
+    pipeline = VoiceActivityDetection(segmentation=model)
+    pipeline.instantiate(config)
+
+    return pipeline
 
 
 def get_args():
@@ -133,7 +172,10 @@ def main():
 
     device = torch.device(args.device)
     model = s3tokenizer.load_model(args.model).to(device)
-    dataset = AudioDataset(args.cuts_path)
+
+    vad_pipeline = get_vad_pipeline()
+    audio_processer = Audio(sample_rate=16000, mono=True)
+    dataset = AudioDataset(args.cuts_path, vad_pipeline, audio_processer)
 
     if args.device == "cuda":
         model = torch.nn.parallel.DistributedDataParallel(
